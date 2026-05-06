@@ -1,0 +1,162 @@
+This is the python code.
+
+import serial
+import time
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+from ctypes import cast, POINTER
+from comtypes import CLSCTX_ALL
+
+# ---- CHANGE THESE IF NEEDED ----
+PICO_PORT = "COM5"
+CHROMEDRIVER_PATH = r"C:\Users\battl\Downloads\chromedriver.exe"
+# --------------------------------
+
+ser = serial.Serial(PICO_PORT, 9600)
+time.sleep(2)
+print(f"Connected to Pico on {PICO_PORT}")
+
+chrome_options = Options()
+chrome_options.add_experimental_option("debuggerAddress", "[INSERT YOUR DEBUGGER ADRESS]")
+service = Service(CHROMEDRIVER_PATH)
+driver = webdriver.Chrome(service=service, options=chrome_options)
+print("Connected to Chrome")
+
+# Cache variables
+yt_handle = None
+last_song = "Unknown"
+last_artist = "Unknown"
+
+def find_yt_music_tab():
+    global yt_handle
+    for handle in driver.window_handles:
+        driver.switch_to.window(handle)
+        if "YouTube Music" in driver.title:
+            yt_handle = handle
+            print(f"Found YouTube Music tab, handle cached")
+            return True
+    return False
+
+def get_system_volume():
+    try:
+        devices = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume = cast(interface, POINTER(IAudioEndpointVolume))
+        return int(volume.GetMasterVolumeLevelScalar() * 100)
+    except:
+        return 0
+
+def get_yt_music_data():
+    global yt_handle, last_song, last_artist
+    try:
+        if yt_handle is None:
+            if not find_yt_music_tab():
+                print("YouTube Music tab not found!")
+                return None
+
+        # Song from tab title — keep last known if title reverts to generic
+        try:
+            title = driver.execute_script("return document.title;")
+        except:
+            yt_handle = None
+            return None
+
+        clean = title.replace(" | YouTube Music", "").replace(" - YouTube Music", "")
+        clean = clean.strip()
+        if clean and clean != "YouTube Music":
+            last_song = clean
+        song = last_song
+        print(f"Song: {song}")
+
+        # Artist from DOM — keep last known if not found
+        try:
+            artist = driver.execute_script("""
+                let selectors = [
+                    'ytmusic-player-bar .subtitle yt-formatted-string a',
+                    'ytmusic-player-bar .byline yt-formatted-string a',
+                    '.ytmusic-player-bar .subtitle a',
+                    'ytmusic-player-bar yt-formatted-string.byline a',
+                ];
+                for (let s of selectors) {
+                    let els = document.querySelectorAll(s);
+                    if (els && els.length > 0) return els[0].textContent.trim();
+                }
+                return null;
+            """)
+            if artist and artist != "Unknown":
+                last_artist = artist
+        except Exception as e:
+            print(f"Artist error: {e}")
+        artist = last_artist
+        print(f"Artist: {artist}")
+
+        # Time via progress bar
+        try:
+            result = driver.execute_script("""
+                let progress = document.querySelector('#progress-bar');
+                if (progress) {
+                    let current = progress.value || 0;
+                    let total = progress.max || 0;
+                    return current + '|' + total;
+                }
+                return null;
+            """)
+            if result:
+                parts_t = result.split('|')
+                pos_secs = int(float(parts_t[0]))
+                dur_secs = int(float(parts_t[1]))
+                pos = f"{pos_secs // 60}:{pos_secs % 60:02d}"
+                dur = f"{dur_secs // 60}:{dur_secs % 60:02d}"
+            else:
+                pos, dur = "0:00", "0:00"
+            print(f"Position: {pos}, Duration: {dur}")
+        except Exception as e:
+            print(f"Time error: {e}")
+            pos, dur = "0:00", "0:00"
+
+        # Volume
+        try:
+            yt_vol = driver.execute_script("""
+                let slider = document.querySelector('#volume-slider');
+                return slider ? slider.value : null;
+            """)
+            volume = int(float(yt_vol)) if yt_vol is not None else get_system_volume()
+            print(f"Volume: {volume}")
+        except:
+            volume = get_system_volume()
+
+        # Play/pause state
+        try:
+            playing = driver.execute_script("""
+                let video = document.querySelector('video');
+                return video ? !video.paused : false;
+            """)
+            play_state = "1" if playing else "0"
+            print(f"Playing: {playing}")
+        except:
+            play_state = "0"
+
+        data = f"SONG:{song}|ARTIST:{artist}|VOL:{volume}|POS:{pos}|DUR:{dur}|PLAY:{play_state}\n"
+        print(f"Sending: {data.strip()}")
+        return data
+
+    except Exception as e:
+        print(f"Error: {e}")
+        yt_handle = None
+        return None
+
+# Find the tab once at startup before the loop
+print("Looking for YouTube Music tab...")
+while not find_yt_music_tab():
+    print("YouTube Music tab not found, retrying in 2 seconds...")
+    time.sleep(2)
+
+print("Starting data loop...")
+while True:
+    data = get_yt_music_data()
+    if data:
+        ser.write(data.encode())
+    time.sleep(1)
+
