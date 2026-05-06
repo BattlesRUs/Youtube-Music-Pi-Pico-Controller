@@ -9,4 +9,20 @@ This python script is used as a bridge between the Raspberry Pi Pico and Youtube
 
 (replacing the highlighted [] portion with a specific folder path to your chrome.exe file)
 
+COMPONENTS:
+Raspberry Pi Pico
+.96in OLED Screen
+Buttons & Button Caps
+
+PINOUT on PI PICO
+
+BUTTONS
+ SKIP_PIN = 9;   
+ PREV_PIN = 10;  
+ PLAY_PIN = 11;  
+
+OLED SCREEN
+ Wire.setSDA(4);
+ Wire.setSCL(5);
+
 
