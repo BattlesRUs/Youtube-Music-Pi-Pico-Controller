@@ -1,0 +1,264 @@
+This is Arduino IDE Code that is uploaded to the Raspberry Pi Pico
+
+
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "Adafruit_TinyUSB.h"
+
+
+
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+
+// Define Pins
+const int SKIP_PIN = 9;   // Physical Pin 12
+const int PREV_PIN = 10;  // Physical Pin 14
+const int PLAY_PIN = 11;  // Physical Pin 15
+const unsigned long DEBOUNCE_DELAY = 50;
+
+
+// Arrays to track states
+int buttonPins[] = { SKIP_PIN, PREV_PIN, PLAY_PIN };
+int lastButtonStates[] = { HIGH, HIGH, HIGH };
+int buttonStates[] = { HIGH, HIGH, HIGH };
+unsigned long lastDebounceTimes[] = { 0, 0, 0 };
+
+
+// Raw HID Consumer Control Codes
+// Skip Next: 0xB5, Previous: 0xB6, Play/Pause: 0xCD
+uint16_t hidCodes[] = { 0x00B5, 0x00B6, 0x00CD };
+
+
+Adafruit_USBD_HID usb_hid;
+
+
+// Report descriptor for a Consumer Control device
+uint8_t const desc_hid_report[] = {
+  TUD_HID_REPORT_DESC_CONSUMER()
+};
+
+
+
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+
+String song = "";
+String artist = "";
+int volume = 0;
+String position = "0:00";
+String duration = "0:00";
+bool isPlaying = false;
+
+
+int scrollOffset = 0;
+unsigned long lastScroll = 0;
+unsigned long lastDisplay = 0;
+
+
+void setup() {
+  for (int i = 0; i < 3; i++) {
+    pinMode(buttonPins[i], INPUT_PULLUP);
+  }
+
+
+  usb_hid.setPollInterval(2);
+  usb_hid.setReportDescriptor(desc_hid_report, sizeof(desc_hid_report));
+  usb_hid.begin();
+
+
+  while (!TinyUSBDevice.mounted()) delay(1);
+
+
+  Wire.setSDA(4);
+  Wire.setSCL(5);
+  Wire.begin();
+  Serial.begin(9600);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(20, 25);
+  display.println("Waiting for data");
+  display.display();
+}
+
+
+String extractValue(String data, String key) {
+  int startIdx = data.indexOf(key);
+  if (startIdx == -1) return "";
+  startIdx += key.length();
+  int endIdx = data.indexOf('|', startIdx);
+  if (endIdx == -1) endIdx = data.length();
+  return data.substring(startIdx, endIdx);
+}
+
+
+void parseData(String data) {
+  song = extractValue(data, "SONG:");
+  artist = extractValue(data, "ARTIST:");
+  volume = extractValue(data, "VOL:").toInt();
+  position = extractValue(data, "POS:");
+  duration = extractValue(data, "DUR:");
+  isPlaying = extractValue(data, "PLAY:") == "1";
+}
+
+
+// Centered text if it fits, scrolling if too long
+void drawCenteredScrollText(String text, int y, int offset) {
+  display.setTextSize(1);
+  int charW = 6;
+  int textWidth = text.length() * charW;
+  if (textWidth <= 128) {
+    int x = (128 - textWidth) / 2;
+    display.setCursor(x, y);
+    display.print(text);
+  } else {
+    String padded = text + "     ";
+    int len = padded.length();
+    int charsVisible = 128 / charW;
+    String result = "";
+    for (int i = 0; i < charsVisible; i++) {
+      result += padded[(offset + i) % len];
+    }
+    display.setCursor(0, y);
+    display.print(result);
+  }
+}
+
+
+int timeToSeconds(String t) {
+  int colonIdx = t.indexOf(':');
+  if (colonIdx == -1) return 0;
+  return t.substring(0, colonIdx).toInt() * 60 + t.substring(colonIdx + 1).toInt();
+}
+
+
+void drawPrevButton(int cx, int cy) {
+  display.fillRect(cx - 8, cy - 7, 2, 15, SSD1306_WHITE);
+  for (int i = 0; i <= 9; i++) {
+    display.drawLine(cx - 5 + i, cy - i, cx - 5 + i, cy + i, SSD1306_WHITE);
+  }
+}
+
+
+void drawNextButton(int cx, int cy) {
+  for (int i = 0; i <= 9; i++) {
+    display.drawLine(cx + 5 - i, cy - i, cx + 5 - i, cy + i, SSD1306_WHITE);
+  }
+  display.fillRect(cx + 7, cy - 7, 2, 15, SSD1306_WHITE);
+}
+
+
+// Play icon — right pointing, centered in circle
+// Play icon — RIGHT pointing ▶, centered in circle
+void drawPlayIcon(int cx, int cy) {
+  // Changing i <= 6 to i <= 5 removes the final single-dot column
+  for (int i = 0; i <= 6; i++) {
+    display.drawLine(cx - 2 + i, cy - (6 - i), cx - 2 + i, cy + (6 - i), SSD1306_WHITE);
+  }
+}
+// Pause icon — two bars centered in circle
+void drawPauseIcon(int cx, int cy) {
+  display.fillRect(cx - 4, cy - 6, 3, 13, SSD1306_WHITE);
+  display.fillRect(cx + 2, cy - 6, 3, 13, SSD1306_WHITE);
+}
+
+
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  // Song title — centered or scrolling
+  drawCenteredScrollText(song, 0, scrollOffset);
+  // Artist — centered or scrolling
+  drawCenteredScrollText(artist, 11, scrollOffset);
+
+
+  // Current time left, total time right
+  display.setCursor(0, 22);
+  display.print(position);
+  int durWidth = duration.length() * 6;
+  display.setCursor(128 - durWidth, 22);
+  display.print(duration);
+
+
+  // Progress bar line
+  display.drawLine(0, 31, 127, 31, SSD1306_WHITE);
+
+
+  // Moving dot on progress bar
+  int posS = timeToSeconds(position);
+  int durS = timeToSeconds(duration);
+  int dotX = (durS > 0) ? map(posS, 0, durS, 2, 125) : 2;
+  display.fillCircle(dotX, 31, 2, SSD1306_WHITE);
+
+
+  // Media controls centered at y=50
+  int cy = 50;
+  drawPrevButton(24, cy);
+  display.drawCircle(64, cy, 12, SSD1306_WHITE);
+  if (isPlaying) {
+    drawPauseIcon(64, cy);
+  } else {
+    drawPlayIcon(64, cy);
+  }
+  drawNextButton(104, cy);
+
+
+  display.display();
+}
+
+
+void loop() {
+  if (Serial.available()) {
+    String data = Serial.readStringUntil('\n');
+    data.trim();
+    if (data.length() > 0) parseData(data);
+  }
+
+
+  if (millis() - lastScroll > 350) {
+    scrollOffset++;
+    lastScroll = millis();
+  }
+
+
+  if (millis() - lastDisplay > 100) {
+    updateDisplay();
+    lastDisplay = millis();
+  }
+
+
+  for (int i = 0; i < 3; i++) {
+    int reading = digitalRead(buttonPins[i]);
+
+
+    if (reading != lastButtonStates[i]) {
+      lastDebounceTimes[i] = millis();
+    }
+
+
+    if ((millis() - lastDebounceTimes[i]) > DEBOUNCE_DELAY) {
+      if (reading != buttonStates[i]) {
+        buttonStates[i] = reading;
+
+
+        if (buttonStates[i] == LOW) {
+          // Send the specific media key code
+          usb_hid.sendReport(0, &hidCodes[i], 2);
+          delay(10);
+          // Release the key (send 0)
+          uint16_t release = 0;
+          usb_hid.sendReport(0, &release, 2);
+        }
+      }
+    }
+    lastButtonStates[i] = reading;
+  }
+}
+
